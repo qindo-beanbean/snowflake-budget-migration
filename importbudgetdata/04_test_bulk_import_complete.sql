@@ -1,8 +1,9 @@
 -- =====================================================
 -- File: 04_test_bulk_import_complete.sql
--- Description: 完整测试 Bulk Import 过程的各类场景
--- 前置条件: 已执行 01_schema_setup.sql 和 02_test_data.sql，
---           会话中已存在变量 $TARGET_BUDGET_ID
+-- Description: End-to-end tests for Bulk Import procedure (multiple scenarios)
+-- Prerequisites:
+--   - 01_schema_setup.sql and 02_test_data.sql have been executed
+--   - Session variable $TARGET_BUDGET_ID is already set
 -- =====================================================
 
 USE DATABASE PLANNING_DB;
@@ -16,11 +17,11 @@ SELECT '========================================' AS INFO;
 SELECT '  TEST CASE 1: SUCCESSFUL IMPORT' AS INFO;
 SELECT '========================================' AS INFO;
 
--- 清理旧数据
+-- Clean up any existing data
 TRUNCATE TABLE BUDGETIMPORT_STAGE;
 DELETE FROM BUDGETLINEITEM WHERE BUDGETHEADERID = $TARGET_BUDGET_ID;
 
--- 插入有效测试数据
+-- Insert valid test records
 INSERT INTO BUDGETIMPORT_STAGE (
   ACCOUNTNUMBER, COSTCENTERCODE, FISCALYEAR, FISCALMONTH,
   ORIGINALAMOUNT, ADJUSTEDAMOUNT, SPREADMETHODCODE, NOTES
@@ -32,7 +33,7 @@ VALUES
 
 SELECT 'Staging data loaded: ' || COUNT(*) || ' rows' AS STATUS FROM BUDGETIMPORT_STAGE;
 
--- 执行导入
+-- Execute import
 DROP TABLE IF EXISTS IMPORTSTAGING_TEMP;
 CALL USP_BULKIMPORTBUDGETDATA_SF(
   'STAGING_TABLE',
@@ -42,7 +43,7 @@ CALL USP_BULKIMPORTBUDGETDATA_SF(
   'REJECT'
 );
 
--- 验证结果
+-- Verify results
 SELECT 'Imported records:' AS INFO;
 SELECT 
   bli.BUDGETLINEITEMID,
@@ -59,7 +60,7 @@ WHERE bli.BUDGETHEADERID = $TARGET_BUDGET_ID
   AND bli.SOURCESYSTEM = 'BULK_IMPORT'
 ORDER BY bli.BUDGETLINEITEMID;
 
--- 期望: 3 rows imported, 0 rejected
+-- Expectation: 3 rows imported, 0 rejected
 
 -- =====================================================
 -- Part 2: TEST CASE 2 - Duplicate Rejection
@@ -69,14 +70,14 @@ SELECT '========================================' AS INFO;
 SELECT '  TEST CASE 2: DUPLICATE REJECTION' AS INFO;
 SELECT '========================================' AS INFO;
 
--- 再导入同样数据（应全部被视为重复）
+-- Import the same data again (should all be treated as duplicates)
 DROP TABLE IF EXISTS IMPORTSTAGING_TEMP;
 CALL USP_BULKIMPORTBUDGETDATA_SF(
   'STAGING_TABLE',
   'BUDGETIMPORT_STAGE',
   $TARGET_BUDGET_ID,
   'STRICT',
-  'REJECT'  -- 应拒绝重复
+  'REJECT'  -- Duplicates should be rejected
 );
 
 -- =====================================================
@@ -87,7 +88,7 @@ SELECT '========================================' AS INFO;
 SELECT '  TEST CASE 3: SKIP DUPLICATES' AS INFO;
 SELECT '========================================' AS INFO;
 
--- 在 staging 中再加一条新记录
+-- Add one more new record into staging
 INSERT INTO BUDGETIMPORT_STAGE (
   ACCOUNTNUMBER, COSTCENTERCODE, FISCALYEAR, FISCALMONTH,
   ORIGINALAMOUNT, ADJUSTEDAMOUNT, SPREADMETHODCODE, NOTES
@@ -97,17 +98,17 @@ VALUES
 
 SELECT 'Staging data now has: ' || COUNT(*) || ' rows' AS STATUS FROM BUDGETIMPORT_STAGE;
 
--- 用 SKIP 模式导入
+-- Import again with SKIP mode so only new records are inserted
 DROP TABLE IF EXISTS IMPORTSTAGING_TEMP;
 CALL USP_BULKIMPORTBUDGETDATA_SF(
   'STAGING_TABLE',
   'BUDGETIMPORT_STAGE',
   $TARGET_BUDGET_ID,
   'STRICT',
-  'SKIP'  -- 跳过重复，只导入新记录
+  'SKIP'  -- Skip duplicates, import only new records
 );
 
--- 检查总行数
+-- Check total number of BULK_IMPORT records
 SELECT 'Total BULK_IMPORT records: ' || COUNT(*) AS STATUS
 FROM BUDGETLINEITEM
 WHERE BUDGETHEADERID = $TARGET_BUDGET_ID
@@ -144,7 +145,7 @@ CALL USP_BULKIMPORTBUDGETDATA_SF(
   'REJECT'
 );
 
--- 查看校验失败的行
+-- Inspect rows that failed validation
 SELECT 'Validation errors:' AS INFO;
 SELECT 
   ROWID,
@@ -184,7 +185,7 @@ CALL USP_BULKIMPORTBUDGETDATA_SF(
   'STAGING_TABLE',
   'BUDGETIMPORT_STAGE',
   $TARGET_BUDGET_ID,
-  'NONE',   -- 不做校验
+  'NONE',   -- Disable validation
   'REJECT'
 );
 
@@ -205,7 +206,7 @@ CALL USP_BULKIMPORTBUDGETDATA_SF(
 );
 
 -- =====================================================
--- 最终汇总
+-- Final summary
 -- =====================================================
 
 SELECT '========================================' AS INFO;

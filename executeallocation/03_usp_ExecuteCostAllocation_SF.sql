@@ -1,0 +1,217 @@
+-- =====================================================
+-- File: 03_usp_ExecuteCostAllocation_SF.sql
+-- Description: Cost Allocation Procedure
+-- Migrated from SQL Server to Snowflake
+-- =====================================================
+
+USE DATABASE PLANNING_DB;
+USE SCHEMA PLANNING;
+
+CREATE OR REPLACE PROCEDURE USP_EXECUTECOSTALLOCATION_SF (
+  BUDGETHEADERID      NUMBER,
+  FISCALPERIODID      NUMBER  DEFAULT NULL,   -- NULL = all periods in budget
+  DRYRUN              BOOLEAN DEFAULT FALSE   -- TRUE = calculate only, don't write
+)
+RETURNS TABLE (
+  ROWSALLOCATED       NUMBER,
+  WARNINGMESSAGES     STRING,
+  RETURNCODE          NUMBER
+)
+LANGUAGE SQL
+AS
+$$
+DECLARE
+  STARTTIME           TIMESTAMP_NTZ := CURRENT_TIMESTAMP();
+  TOTAL_ROWS          NUMBER := 0;
+  ROWSALLOCATED       NUMBER := 0;
+  WARNINGMESSAGES     STRING;
+  RETURNCODE          NUMBER := 0;
+  
+  -- Validation variables
+  BUDGET_EXISTS       NUMBER;
+  ACTIVE_RULES_COUNT  NUMBER;
+  
+  res RESULTSET;
+BEGIN
+  --------------------------------------------------------------------
+  -- 1. Basic validation: Check if budget header exists
+  --------------------------------------------------------------------
+  SELECT COUNT(*) INTO :BUDGET_EXISTS
+  FROM BUDGETHEADER 
+  WHERE BUDGETHEADERID = :BUDGETHEADERID;
+  
+  IF (:BUDGET_EXISTS = 0) THEN
+    WARNINGMESSAGES := 'BudgetHeader not found: ' || :BUDGETHEADERID;
+    ROWSALLOCATED := 0;
+    RETURNCODE := -1;
+    res := (
+      SELECT 
+        :ROWSALLOCATED AS ROWSALLOCATED,
+        :WARNINGMESSAGES AS WARNINGMESSAGES,
+        :RETURNCODE AS RETURNCODE
+    );
+    RETURN TABLE(res);
+  END IF;
+
+  --------------------------------------------------------------------
+  -- 2. Select allocation rules (active and within effective dates)
+  --------------------------------------------------------------------
+  DROP TABLE IF EXISTS RULES_TEMP;
+  CREATE TEMP TABLE RULES_TEMP AS
+  SELECT
+    AR.ALLOCATIONRULEID,
+    AR.ALLOCATIONBASIS,
+    AR.ROUNDINGMETHOD
+  FROM ALLOCATIONRULE AR
+  WHERE AR.ISACTIVE = TRUE
+    AND AR.ALLOCATIONMETHOD IS NOT NULL
+    AND AR.EFFECTIVEFROMDATE <= CURRENT_DATE()
+    AND (AR.EFFECTIVETODATE IS NULL OR AR.EFFECTIVETODATE >= CURRENT_DATE());
+
+  SELECT COUNT(*) INTO :ACTIVE_RULES_COUNT FROM RULES_TEMP;
+  
+  IF (:ACTIVE_RULES_COUNT = 0) THEN
+    WARNINGMESSAGES := 'No active allocation rules found.';
+    ROWSALLOCATED := 0;
+    RETURNCODE := 0;
+    res := (
+      SELECT 
+        :ROWSALLOCATED AS ROWSALLOCATED,
+        :WARNINGMESSAGES AS WARNINGMESSAGES,
+        :RETURNCODE AS RETURNCODE
+    );
+    RETURN TABLE(res);
+  END IF;
+
+  --------------------------------------------------------------------
+  -- 3. Generate allocation results to temp table
+  --    Assumes existence of:
+  --      - View: VW_ALLOCATIONRULETARGETS
+  --      - Function: FN_GETALLOCATIONFACTOR
+  --------------------------------------------------------------------
+  DROP TABLE IF EXISTS ALLOC_RESULTS_TEMP;
+  CREATE TEMP TABLE ALLOC_RESULTS_TEMP AS
+  SELECT
+    src.BUDGETLINEITEMID             AS SOURCEBUDGETLINEITEMID,
+    vt.TARGETCOSTCENTERID            AS TARGETCOSTCENTERID,
+    vt.TARGETGLACCOUNTID             AS TARGETGLACCOUNTID,
+    -- Calculate allocation percentage
+    COALESCE(
+      vt.TARGETALLOCATIONPCT,
+      FN_GETALLOCATIONFACTOR(
+        src.COSTCENTERID,
+        vt.TARGETCOSTCENTERID,
+        r.ALLOCATIONBASIS,
+        src.FISCALPERIODID,
+        :BUDGETHEADERID
+      )
+    )                                 AS ALLOCPCT,
+    r.ROUNDINGMETHOD                  AS ROUNDINGMETHOD,
+    r.ALLOCATIONRULEID                AS ALLOCATIONRULEID,
+    src.FISCALPERIODID                AS FISCALPERIODID,
+    (src.ORIGINALAMOUNT + src.ADJUSTEDAMOUNT) AS SOURCEFINAL
+  FROM RULES_TEMP r
+  JOIN VW_ALLOCATIONRULETARGETS vt
+    ON vt.ALLOCATIONRULEID = r.ALLOCATIONRULEID
+   AND vt.TARGETISACTIVE = TRUE
+  JOIN BUDGETLINEITEM src
+    ON src.BUDGETHEADERID = :BUDGETHEADERID
+   AND src.ISALLOCATED = FALSE
+   AND (src.ORIGINALAMOUNT + src.ADJUSTEDAMOUNT) <> 0
+   AND (:FISCALPERIODID IS NULL OR src.FISCALPERIODID = :FISCALPERIODID);
+
+  -- Calculate actual allocated amounts
+  DROP TABLE IF EXISTS ALLOC_RESULTS_FINAL;
+  CREATE TEMP TABLE ALLOC_RESULTS_FINAL AS
+  SELECT
+    SOURCEBUDGETLINEITEMID,
+    TARGETCOSTCENTERID,
+    TARGETGLACCOUNTID,
+    CASE
+      WHEN ROUNDINGMETHOD = 'UP' THEN CEIL(SOURCEFINAL * ALLOCPCT * 100) / 100
+      WHEN ROUNDINGMETHOD = 'DOWN' THEN FLOOR(SOURCEFINAL * ALLOCPCT * 100) / 100
+      ELSE ROUND(SOURCEFINAL * ALLOCPCT, 2)
+    END AS ALLOCATEDAMOUNT,
+    ALLOCPCT AS ALLOCATIONPERCENTAGE,
+    ALLOCATIONRULEID,
+    FISCALPERIODID
+  FROM ALLOC_RESULTS_TEMP;
+
+  SELECT COUNT(*) INTO :TOTAL_ROWS FROM ALLOC_RESULTS_FINAL;
+
+  --------------------------------------------------------------------
+  -- 4. Write back to budget table (if not DRYRUN)
+  --------------------------------------------------------------------
+  IF (:DRYRUN = FALSE AND :TOTAL_ROWS > 0) THEN
+    INSERT INTO BUDGETLINEITEM (
+      BUDGETHEADERID,
+      GLACCOUNTID,
+      COSTCENTERID,
+      FISCALPERIODID,
+      ORIGINALAMOUNT,
+      ADJUSTEDAMOUNT,
+      ISALLOCATED,
+      ALLOCATIONSOURCELINEID,
+      ALLOCATIONPERCENTAGE,
+      LASTMODIFIEDBYUSERID,
+      LASTMODIFIEDDATETIME,
+      SOURCESYSTEM,
+      SOURCEREFERENCE
+    )
+    SELECT
+      :BUDGETHEADERID,
+      r.TARGETGLACCOUNTID,
+      r.TARGETCOSTCENTERID,
+      r.FISCALPERIODID,
+      r.ALLOCATEDAMOUNT,
+      0,
+      TRUE,
+      r.SOURCEBUDGETLINEITEMID,
+      r.ALLOCATIONPERCENTAGE,
+      0,
+      CURRENT_TIMESTAMP(),
+      'COST_ALLOCATION',
+      'RULE:' || r.ALLOCATIONRULEID
+    FROM ALLOC_RESULTS_FINAL r;
+
+    -- Mark source rows as allocated
+    UPDATE BUDGETLINEITEM
+    SET ISALLOCATED = TRUE,
+        LASTMODIFIEDDATETIME = CURRENT_TIMESTAMP()
+    WHERE BUDGETLINEITEMID IN (
+      SELECT DISTINCT SOURCEBUDGETLINEITEMID FROM ALLOC_RESULTS_FINAL
+    );
+
+    ROWSALLOCATED := SQLROWCOUNT;
+  ELSE
+    ROWSALLOCATED := TOTAL_ROWS;
+  END IF;
+
+  WARNINGMESSAGES := NULL;
+  RETURNCODE := 0;
+  
+  res := (
+    SELECT 
+      :ROWSALLOCATED AS ROWSALLOCATED,
+      :WARNINGMESSAGES AS WARNINGMESSAGES,
+      :RETURNCODE AS RETURNCODE
+  );
+  RETURN TABLE(res);
+
+EXCEPTION
+  WHEN OTHER THEN
+    WARNINGMESSAGES := SQLERRM;
+    ROWSALLOCATED := 0;
+    RETURNCODE := -1;
+    res := (
+      SELECT 
+        :ROWSALLOCATED AS ROWSALLOCATED,
+        :WARNINGMESSAGES AS WARNINGMESSAGES,
+        :RETURNCODE AS RETURNCODE
+    );
+    RETURN TABLE(res);
+END;
+$$;
+
+-- Verify procedure was created successfully
+SHOW PROCEDURES LIKE 'USP_EXECUTECOSTALLOCATION_SF';

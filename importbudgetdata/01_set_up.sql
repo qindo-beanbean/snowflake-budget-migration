@@ -2,7 +2,7 @@
 USE DATABASE PLANNING_DB;
 USE SCHEMA PLANNING;
 
--- 创建/重建导入用的 staging 表
+-- Create / recreate the staging table used for bulk budget import
 CREATE OR REPLACE TABLE BUDGETIMPORT_STAGE (
   ACCOUNTNUMBER     STRING,
   COSTCENTERCODE    STRING,

@@ -1,6 +1,6 @@
 -- =====================================================
 -- File: 02_test_data.sql
--- Purpose: 准备 Bulk Import 的基础主数据和目标预算头
+-- Purpose: Prepare master data and target budget header for Bulk Import
 -- =====================================================
 
 USE DATABASE PLANNING_DB;
@@ -49,7 +49,7 @@ WHERE NOT EXISTS (
   SELECT 1 FROM FISCALPERIOD WHERE FISCALYEAR = 2024 AND FISCALMONTH = 2
 );
 
--- Target Budget Header（导入目标预算版本）
+-- Target Budget Header (target budget version for import)
 INSERT INTO BUDGETHEADER (
   BUDGETCODE, BUDGETNAME, BUDGETTYPE, SCENARIOTYPE,
   FISCALYEAR, STARTPERIODID, ENDPERIODID,
@@ -68,7 +68,7 @@ SELECT
   1
 WHERE NOT EXISTS (SELECT 1 FROM BUDGETHEADER WHERE BUDGETCODE = 'BUD_IMPORT_TEST');
 
--- 保存目标预算头 ID 到会话变量，后续脚本会用到
+-- Save target budget header ID into a session variable for later scripts
 SET TARGET_BUDGET_ID = (
   SELECT BUDGETHEADERID
   FROM BUDGETHEADER
