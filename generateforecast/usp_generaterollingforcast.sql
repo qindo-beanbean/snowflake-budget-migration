@@ -1,0 +1,339 @@
+-- =====================================================
+-- File: usp_GenerateRollingForecast_SF.sql
+-- Description: Generate Rolling Forecast based on historical data
+-- Migrated from SQL Server to Snowflake
+-- =====================================================
+
+USE DATABASE PLANNING_DB;
+USE SCHEMA PLANNING;
+
+CREATE OR REPLACE PROCEDURE USP_GENERATEROLLINGFORECAST_SF (
+  BASEBUDGETHEADERID      NUMBER,
+  HISTORICALPERIODS       NUMBER DEFAULT 12,          -- Historical months
+  FORECASTPERIODS         NUMBER DEFAULT 12,          -- Forecast months
+  FORECASTMETHOD          STRING DEFAULT 'WEIGHTED_AVERAGE',
+  GROWTHRATEOVERRIDE      NUMBER(8,4) DEFAULT NULL    -- Optional growth rate override
+)
+RETURNS TABLE (
+  TARGETBUDGETHEADERID    NUMBER,
+  FORECASTACCURACYMETRICS VARIANT,
+  RETURNCODE              NUMBER
+)
+LANGUAGE SQL
+AS
+$$
+DECLARE
+  STARTTIME      TIMESTAMP_NTZ := CURRENT_TIMESTAMP();
+
+  SRC_BUDGETCODE    STRING;
+  SRC_BUDGETNAME    STRING;
+  SRC_FISCALYEAR    NUMBER;
+  SRC_STARTPERIODID NUMBER;
+  SRC_ENDPERIODID   NUMBER;
+
+  LAST_ACTUAL_PERIODID NUMBER;
+  BASELINE_START_SEQ   NUMBER;
+  ROWCOUNT_HIST        NUMBER;
+  
+  TARGETBUDGETHEADERID    NUMBER;
+  FORECASTACCURACYMETRICS VARIANT;
+  RETURNCODE              NUMBER := 0;
+  
+  -- Validation variables
+  BUDGET_EXISTS           NUMBER;
+  
+  res RESULTSET;
+BEGIN
+  --------------------------------------------------------------------
+  -- 1. Read base budget info and validate
+  --------------------------------------------------------------------
+  SELECT COUNT(*) INTO :BUDGET_EXISTS
+  FROM BUDGETHEADER
+  WHERE BUDGETHEADERID = :BASEBUDGETHEADERID;
+  
+  IF (:BUDGET_EXISTS = 0) THEN
+    TARGETBUDGETHEADERID := NULL;
+    FORECASTACCURACYMETRICS := OBJECT_CONSTRUCT(
+      'status', 'BUDGET_NOT_FOUND',
+      'baseBudgetHeaderId', :BASEBUDGETHEADERID
+    );
+    RETURNCODE := -1;
+    res := (
+      SELECT 
+        :TARGETBUDGETHEADERID AS TARGETBUDGETHEADERID,
+        :FORECASTACCURACYMETRICS AS FORECASTACCURACYMETRICS,
+        :RETURNCODE AS RETURNCODE
+    );
+    RETURN TABLE(res);
+  END IF;
+  
+  SELECT
+    BUDGETCODE,
+    BUDGETNAME,
+    FISCALYEAR,
+    STARTPERIODID,
+    ENDPERIODID
+  INTO
+    :SRC_BUDGETCODE,
+    :SRC_BUDGETNAME,
+    :SRC_FISCALYEAR,
+    :SRC_STARTPERIODID,
+    :SRC_ENDPERIODID
+  FROM BUDGETHEADER
+  WHERE BUDGETHEADERID = :BASEBUDGETHEADERID;
+
+  --------------------------------------------------------------------
+  -- 2. Build historical data: recent N months of actuals
+  --------------------------------------------------------------------
+  DROP TABLE IF EXISTS HIST_WORKSPACE;
+  CREATE TEMP TABLE HIST_WORKSPACE AS
+  SELECT
+    bli.GLACCOUNTID,
+    bli.COSTCENTERID,
+    bli.FISCALPERIODID,
+    fp.FISCALYEAR,
+    fp.FISCALMONTH,
+    (bli.ORIGINALAMOUNT + bli.ADJUSTEDAMOUNT) AS ACTUALAMOUNT
+  FROM BUDGETLINEITEM bli
+  JOIN FISCALPERIOD fp
+    ON bli.FISCALPERIODID = fp.FISCALPERIODID
+  WHERE bli.BUDGETHEADERID = :BASEBUDGETHEADERID;
+
+  -- Number recent N months for each (Account, CostCenter)
+  DROP TABLE IF EXISTS HIST_NUMBERED;
+  CREATE TEMP TABLE HIST_NUMBERED AS
+  SELECT *
+  FROM (
+    SELECT
+      GLACCOUNTID,
+      COSTCENTERID,
+      FISCALPERIODID,
+      FISCALYEAR,
+      FISCALMONTH,
+      ACTUALAMOUNT,
+      ROW_NUMBER() OVER (
+        PARTITION BY GLACCOUNTID, COSTCENTERID
+        ORDER BY FISCALYEAR DESC, FISCALMONTH DESC
+      ) AS RN_DESC
+    FROM HIST_WORKSPACE
+  )
+  WHERE RN_DESC <= :HISTORICALPERIODS;
+
+  SELECT COUNT(*) INTO :ROWCOUNT_HIST FROM HIST_NUMBERED;
+  
+  IF (:ROWCOUNT_HIST = 0) THEN
+    -- No historical data
+    TARGETBUDGETHEADERID := NULL;
+    FORECASTACCURACYMETRICS := OBJECT_CONSTRUCT(
+      'status', 'NO_HISTORY',
+      'baseBudgetHeaderId', :BASEBUDGETHEADERID
+    );
+    RETURNCODE := 0;
+    res := (
+      SELECT 
+        :TARGETBUDGETHEADERID AS TARGETBUDGETHEADERID,
+        :FORECASTACCURACYMETRICS AS FORECASTACCURACYMETRICS,
+        :RETURNCODE AS RETURNCODE
+    );
+    RETURN TABLE(res);
+  END IF;
+
+  --------------------------------------------------------------------
+  -- 3. Calculate baseline mean and trend for each (GLAccount, CostCenter)
+  --    Mean: weighted average of recent N periods (newer = higher weight)
+  --    Trend: average growth rate (simplified)
+  --------------------------------------------------------------------
+  DROP TABLE IF EXISTS HIST_WITH_WEIGHTS;
+  CREATE TEMP TABLE HIST_WITH_WEIGHTS AS
+  SELECT
+    GLACCOUNTID,
+    COSTCENTERID,
+    FISCALPERIODID,
+    FISCALYEAR,
+    FISCALMONTH,
+    ACTUALAMOUNT,
+    RN_DESC,
+    POWER(0.9, RN_DESC - 1) AS WEIGHTFACTOR
+  FROM HIST_NUMBERED;
+
+  DROP TABLE IF EXISTS BASELINE_STATS;
+  CREATE TEMP TABLE BASELINE_STATS AS
+  SELECT
+    GLACCOUNTID,
+    COSTCENTERID,
+    SUM(ACTUALAMOUNT * WEIGHTFACTOR) / NULLIF(SUM(WEIGHTFACTOR),0) AS WEIGHTEDAVG,
+    AVG(
+      CASE
+        WHEN LAG(ACTUALAMOUNT) OVER (
+          PARTITION BY GLACCOUNTID, COSTCENTERID
+          ORDER BY FISCALYEAR, FISCALMONTH
+        ) > 0
+        THEN ACTUALAMOUNT
+             / LAG(ACTUALAMOUNT) OVER (
+                 PARTITION BY GLACCOUNTID, COSTCENTERID
+                 ORDER BY FISCALYEAR, FISCALMONTH
+               ) - 1
+        ELSE NULL
+      END
+    ) AS AVGGROWTH
+  FROM HIST_WITH_WEIGHTS
+  GROUP BY GLACCOUNTID, COSTCENTERID;
+
+  --------------------------------------------------------------------
+  -- 4. Determine last actual period and future periods to forecast
+  --------------------------------------------------------------------
+  SELECT MAX(FISCALPERIODID) INTO :LAST_ACTUAL_PERIODID
+  FROM HIST_WORKSPACE;
+
+  DROP TABLE IF EXISTS FUTURE_PERIODS;
+  CREATE TEMP TABLE FUTURE_PERIODS AS
+  SELECT
+    FISCALPERIODID,
+    FISCALYEAR,
+    FISCALMONTH,
+    ROW_NUMBER() OVER (ORDER BY FISCALYEAR, FISCALMONTH) AS FUTURE_SEQ
+  FROM FISCALPERIOD
+  WHERE FISCALPERIODID > :LAST_ACTUAL_PERIODID
+  ORDER BY FISCALYEAR, FISCALMONTH
+  LIMIT :FORECASTPERIODS;
+
+  --------------------------------------------------------------------
+  -- 5. Generate forecast rows (to temp table first)
+  --------------------------------------------------------------------
+  DROP TABLE IF EXISTS FORECAST_WORKSPACE;
+  CREATE TEMP TABLE FORECAST_WORKSPACE AS
+  SELECT
+    bs.GLACCOUNTID,
+    bs.COSTCENTERID,
+    fp.FISCALPERIODID,
+    fp.FISCALYEAR,
+    fp.FISCALMONTH,
+    fp.FUTURE_SEQ,
+    CASE UPPER(:FORECASTMETHOD)
+      WHEN 'WEIGHTED_AVERAGE' THEN
+        bs.WEIGHTEDAVG
+        * POWER(
+            1 + COALESCE(:GROWTHRATEOVERRIDE, COALESCE(bs.AVGGROWTH, 0)),
+            fp.FUTURE_SEQ
+          )
+      WHEN 'LINEAR_TREND' THEN
+        bs.WEIGHTEDAVG
+        + (COALESCE(:GROWTHRATEOVERRIDE, COALESCE(bs.AVGGROWTH, 0))
+           * fp.FUTURE_SEQ * bs.WEIGHTEDAVG)
+      ELSE
+        bs.WEIGHTEDAVG
+    END AS FORECASTAMOUNT
+  FROM BASELINE_STATS bs
+  CROSS JOIN FUTURE_PERIODS fp;
+
+  --------------------------------------------------------------------
+  -- 6. Create target budget header
+  --------------------------------------------------------------------
+  INSERT INTO BUDGETHEADER (
+    BUDGETCODE,
+    BUDGETNAME,
+    BUDGETTYPE,
+    SCENARIOTYPE,
+    FISCALYEAR,
+    STARTPERIODID,
+    ENDPERIODID,
+    BASEBUDGETHEADERID,
+    STATUSCODE
+  )
+  SELECT
+    :SRC_BUDGETCODE || '_FORECAST_' || TO_VARCHAR(CURRENT_DATE(), 'YYYYMMDD'),
+    :SRC_BUDGETNAME || ' - Rolling Forecast',
+    'ROLLING',
+    'FORECAST',
+    :SRC_FISCALYEAR,
+    :SRC_STARTPERIODID,
+    (SELECT MAX(FISCALPERIODID) FROM FORECAST_WORKSPACE),
+    :BASEBUDGETHEADERID,
+    'DRAFT';
+
+  SELECT MAX(BUDGETHEADERID)
+  INTO :TARGETBUDGETHEADERID
+  FROM BUDGETHEADER
+  WHERE BASEBUDGETHEADERID = :BASEBUDGETHEADERID
+    AND BUDGETCODE LIKE :SRC_BUDGETCODE || '_FORECAST_%';
+
+  --------------------------------------------------------------------
+  -- 7. Write forecast results to BudgetLineItem
+  --------------------------------------------------------------------
+  INSERT INTO BUDGETLINEITEM (
+    BUDGETHEADERID,
+    GLACCOUNTID,
+    COSTCENTERID,
+    FISCALPERIODID,
+    ORIGINALAMOUNT,
+    ADJUSTEDAMOUNT,
+    SPREADMETHODCODE,
+    SOURCESYSTEM,
+    SOURCEREFERENCE,
+    ISALLOCATED,
+    LASTMODIFIEDBYUSERID,
+    LASTMODIFIEDDATETIME
+  )
+  SELECT
+    :TARGETBUDGETHEADERID,
+    GLACCOUNTID,
+    COSTCENTERID,
+    FISCALPERIODID,
+    FORECASTAMOUNT,
+    0,
+    :FORECASTMETHOD,
+    'ROLLING_FORECAST',
+    'BASE:' || :BASEBUDGETHEADERID,
+    FALSE,
+    0,
+    CURRENT_TIMESTAMP()
+  FROM FORECAST_WORKSPACE
+  WHERE FORECASTAMOUNT IS NOT NULL;
+
+  --------------------------------------------------------------------
+  -- 8. Build metrics output
+  --------------------------------------------------------------------
+  FORECASTACCURACYMETRICS := OBJECT_CONSTRUCT(
+    'forecastMethod',       :FORECASTMETHOD,
+    'historicalPeriods',    :HISTORICALPERIODS,
+    'forecastPeriods',      :FORECASTPERIODS,
+    'baseBudgetHeaderId',   :BASEBUDGETHEADERID,
+    'targetBudgetHeaderId', :TARGETBUDGETHEADERID,
+    'historyPoints',
+      (SELECT COUNT(*) FROM HIST_WITH_WEIGHTS),
+    'forecastPoints',
+      (SELECT COUNT(*) FROM FORECAST_WORKSPACE),
+    'execTimeMs',
+      DATEDIFF('millisecond', :STARTTIME, CURRENT_TIMESTAMP())
+  );
+
+  RETURNCODE := 0;
+  res := (
+    SELECT 
+      :TARGETBUDGETHEADERID AS TARGETBUDGETHEADERID,
+      :FORECASTACCURACYMETRICS AS FORECASTACCURACYMETRICS,
+      :RETURNCODE AS RETURNCODE
+  );
+  RETURN TABLE(res);
+
+EXCEPTION
+  WHEN OTHER THEN
+    TARGETBUDGETHEADERID := NULL;
+    FORECASTACCURACYMETRICS := OBJECT_CONSTRUCT(
+      'status',  'ERROR',
+      'message', SQLERRM,
+      'sqlcode', SQLCODE
+    );
+    RETURNCODE := -1;
+    res := (
+      SELECT 
+        :TARGETBUDGETHEADERID AS TARGETBUDGETHEADERID,
+        :FORECASTACCURACYMETRICS AS FORECASTACCURACYMETRICS,
+        :RETURNCODE AS RETURNCODE
+    );
+    RETURN TABLE(res);
+END;
+$$;
+
+-- Verify procedure was created successfully
+SHOW PROCEDURES LIKE 'USP_GENERATEROLLINGFORECAST_SF';
